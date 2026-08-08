@@ -74,14 +74,17 @@ def split_message(text: str) -> Iterable[str]:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Привет! Я AI-ассистент. Напишите вопрос или отправьте изображение — "
-        "я отвечу с учётом нашего диалога.\n\n"
-        "Команды:\n/reset — очистить историю\n"
-        "/remind 30 Позвонить маме — напомнить через 30 минут\n"
-        "/image космический кот — создать AI-изображение\n"
-        "/slides Тема презентации — создать PowerPoint\n"
-        "/help — показать помощь"
+        "👋 **Welcome / Привет!**\n\n"
+        "🇬🇧 I am an AI coding mentor and study assistant. Send me a message, a snippet of code, or a photo to get started!\n\n"
+        "🇷🇺 Я AI-ментор и помощник в учебе. Напиши мне вопрос, отправь код или фото задачи!\n\n"
+        "📌 **Commands / Команды:**\n"
+        "/reset — Clear context / Очистить историю\n"
+        "/slides <topic> — Create PPTX / Создать презентацию\n"
+        "/image <prompt> — Generate image / AI-картинка\n"
+        "/remind <min> <text> — Set reminder / Напоминание\n"
+        "/help — Full instructions / Помощь"
     )
+    
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
