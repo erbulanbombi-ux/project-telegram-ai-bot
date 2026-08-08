@@ -25,5 +25,5 @@ An intelligent Telegram assistant built with Python and the Google GenAI SDK. De
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/erbulanbombi-ux/project-telegram-ai-bot.git](https://github.com/erbulanbombi-ux/project-telegram-ai-bot.git)
+   git clone https://github.com/erbulanbombi-ux/project-telegram-ai-bot.git
    cd project-telegram-ai-bot
