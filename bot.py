@@ -1,9 +1,9 @@
 """Telegram-бот с контекстным AI-ассистентом на Gemini API."""
+import asyncio
 import json
 import logging
 import os
 import threading
-import time
 from collections.abc import Iterable
 from datetime import timedelta
 from io import BytesIO
@@ -55,6 +55,13 @@ API_KEYS = [
 ]
 API_KEYS = [k for k in API_KEYS if k]
 
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
 async def ask_gemini_with_fallback(contents, system_instruction=None, model=None, response_mime_type=None):
     """Функция ротации ключей для асинхронных запросов."""
     target_model = model or MODEL
@@ -75,13 +82,18 @@ async def ask_gemini_with_fallback(contents, system_instruction=None, model=None
             )
             return response
         except errors.APIError as e:
-            if "429" in str(e):
-                logger.warning(f"Ключ исчерпал лимит, переключаемся на следующий...")
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                logger.warning(f"Ключ {key[:8]}... исчерпал лимит, переключаемся на следующий...")
                 continue
+            logger.error(f"Ошибка Gemini API: {e}")
+            raise e
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка при запросе к Gemini: {e}")
             raise e
 
-    # Если все ключи превысили лимит — делаем паузу 4 секунды и пробуем первый
-    time.sleep(4)
+    # Неблокирующая пауза, если все ключи превысили лимит
+    logger.warning("Все API ключи исчерпали лимит. Ждем 4 секунды...")
+    await asyncio.sleep(4)
     client = genai.Client(api_key=API_KEYS[0])
     return await client.aio.models.generate_content(
         model=target_model,
@@ -100,20 +112,6 @@ SYSTEM_PROMPT = """
 5. Общайся естественно, легко и поддерживающе, как дружелюбный старший товарищ.
 6. НЕ используй LaTeX и знаки доллара ($ или $$). Для математических формул используй обычные символы Unicode (x², x₁, √D).
 """
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-
-def _safe_reply(message, text: str) -> None:
-    try:
-        if hasattr(message, "reply_text"):
-            message.reply_text(text)
-    except Exception:
-        logger.exception("Failed to send Telegram reply")
 
 
 def split_message(text: str) -> Iterable[str]:
@@ -158,7 +156,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Напоминание: /remind <минуты> <текст>\n"
         "Пример: /remind 30 Выпить воды\n\n"
         "AI-изображение: /image <описание>\n"
-        "Презентация: /slides <тема>. Можно отправить фото с подписью «/slides "
+        "Презентация: /slides <тема>. Можно отправить фото с подписью «/slides» "
         "— оно станет основой презентации и попадёт на титульный слайд.\n\n"
         "Используйте /reset, если хотите начать новую тему."
     )
@@ -191,9 +189,7 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if context.job_queue is None:
-        await update.effective_message.reply_text(
-            "Напоминания не настроены."
-        )
+        await update.effective_message.reply_text("Напоминания не настроены.")
         return
 
     reminder_text = " ".join(context.args[1:])
@@ -398,7 +394,7 @@ async def slides_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         await update.effective_chat.send_action(ChatAction.TYPING)
         response = await ask_gemini_with_fallback(
-            contents=types.Content(role="user", parts=contents),
+            contents=contents,
             response_mime_type="application/json"
         )
         outline = json.loads((response.text or "").strip())
@@ -473,7 +469,6 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ChatAction.UPLOAD_PHOTO if image else ChatAction.TYPING
         )
         
-        # Передаём запрос в функцию с ротацией ключей
         response = await ask_gemini_with_fallback(
             contents=contents,
             system_instruction=SYSTEM_PROMPT
