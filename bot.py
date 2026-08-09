@@ -63,20 +63,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def is_gemini_unavailable_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(token in message for token in (
+        "429",
+        "resource_exhausted",
+        "quota",
+        "rate limit",
+        "retry delay",
+        "temporarily unavailable",
+        "timed out",
+        "connection",
+        "service unavailable",
+    ))
+
+
+def format_gemini_error_message(error: Exception) -> str:
+    if is_gemini_unavailable_error(error):
+        return (
+            "Сейчас Gemini временно недоступен или достигнут лимит запросов. "
+            "Подождите немного и попробуйте ещё раз."
+        )
+
+    message = str(error).lower()
+    if "api key" in message or "authentication" in message:
+        return "Не удалось подключиться к Gemini. Проверьте API-ключ."
+
+    return "Произошла ошибка при обращении к Gemini. Попробуйте еще раз."
+
+
 SYSTEM_PROMPT = """
 Ты — сильный, опытный AI-разработчик и понятный ментор по программированию для новичков.
 
 ТВОЙ СТИЛЬ И ПРАВИЛА ОТВЕТА:
-1. При написании любой программы или исправлении ошибок СТРОГО оборачивай код в блоки Markdown с указанием языка (например, ```python ... ```).
-2. Объясняй ошибки простым и доступным языком. Избегай сухих академических терминов.
-3. Пиши чистый, рабочий и понятный код.
-4. Сначала давай полностью исправленный код в блоке, а затем простым языком поясняй, в чём были ошибки и как они исправлены.
-5. Общайся естественно, легко и поддерживающе.
-6. НЕ используй LaTeX и знаки доллара ($ или $$). Для математических формул используй обычные символы Unicode (x², x₁, √D).
+1. ВСЕГДА оборачивай ВСЕ коды в блоки Markdown с указанием языка. НИКОГДА не пиши код без блока.
+   ✓ Правильно:
+   ```python
+   def hello():
+       print("Hello")
+   ```
+   ✓ Правильно для Bash/Shell:
+   ```bash
+   git add bot.py
+   git commit -m "fix"
+   git push
+   ```
+   ✗ Неправильно:
+   def hello():
+       print("Hello")
+
+2. Указывай язык программирования ВСЕГДА: python, javascript, bash, sql, html, css, java, cpp, go, rust, kotlin, swift и т.д.
+3. Объясняй ошибки простым и доступным языком. Избегай сухих академических терминов.
+4. Пиши чистый, рабочий и понятный код.
+5. Сначала давай полностью исправленный код в блоке, а затем простым языком поясняй, в чём были ошибки и как они исправлены.
+6. Общайся естественно, легко и поддерживающе.
+7. НЕ используй LaTeX и знаки доллара ($ или $$). Для математических формул используй обычные символы Unicode (x², x₁, √D).
 """
 
 # --- ФУНКЦИЯ РОТАЦИИ КЛЮЧЕЙ (БЕЗ БЛОКИРОВКИ EVENT LOOP) ---
 async def ask_gemini_with_fallback(contents, system_instruction=None, model=None, response_mime_type=None):
+    if not API_KEYS:
+        raise RuntimeError("No GEMINI_API_KEY provided")
+
     target_model = model or MODEL
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
@@ -85,28 +134,34 @@ async def ask_gemini_with_fallback(contents, system_instruction=None, model=None
         response_mime_type=response_mime_type
     )
 
-    for i, key in enumerate(API_KEYS):
-        try:
-            client = genai.Client(api_key=key)
-            response = await client.aio.models.generate_content(
-                model=target_model,
-                contents=contents,
-                config=config
-            )
-            return response
-        except Exception as e:
-            logger.warning(f"Ключ #{i+1} ({key[:8]}...) выдал ошибку: {e}")
+    last_error = None
+    for attempt in range(2):
+        for i, key in enumerate(API_KEYS):
+            try:
+                client = genai.Client(api_key=key)
+                response = await client.aio.models.generate_content(
+                    model=target_model,
+                    contents=contents,
+                    config=config
+                )
+                return response
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Ключ #{i+1} ({key[:8]}...) выдал ошибку на попытке {attempt + 1}: {e}")
+                if not is_gemini_unavailable_error(e):
+                    break
+
+        if attempt == 0 and is_gemini_unavailable_error(last_error):
+            logger.warning("Временная ошибка Gemini. Повторяем запрос через 2 секунды...")
+            await asyncio.sleep(2)
             continue
 
-    # Если все ключи временно заблокированы — делаем паузу 4 секунды
-    logger.warning("Все API ключи исчерпали лимит. Ждем 4 секунды...")
-    await asyncio.sleep(4)
-    client = genai.Client(api_key=API_KEYS[0])
-    return await client.aio.models.generate_content(
-        model=target_model,
-        contents=contents,
-        config=config
-    )
+        break
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("Gemini request failed")
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def split_message(text: str) -> Iterable[str]:
@@ -217,7 +272,7 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     except Exception as error:
         logger.exception("Image generation failed: %s", error)
-        await update.effective_message.reply_text("Ошибка при создании изображения.")
+        await update.effective_message.reply_text(format_gemini_error_message(error))
 
 # --- ГЕНЕРАЦИЯ ПРЕЗЕНТАЦИЙ (PPTX) ---
 def add_textbox(slide, text: str, left, top, width, height, size: int, color) -> None:
@@ -445,7 +500,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     except Exception as error:
         logger.error("Ошибка в функции chat: %s", error, exc_info=True)
-        await update.effective_message.reply_text("Произошла ошибка при обращении к Gemini. Попробуйте еще раз.")
+        await update.effective_message.reply_text(format_gemini_error_message(error))
         return
 
     # Сохраняем успешный ответ в историю
