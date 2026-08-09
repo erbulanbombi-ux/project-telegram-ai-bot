@@ -35,7 +35,7 @@ IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image").strip()
 MAX_HISTORY_MESSAGES = 12
 TELEGRAM_MESSAGE_LIMIT = 4096
 
-system_instruction = """
+SYSTEM_PROMPT = """
 Ты — современный, умный и дружелюбный AI-ассистент в Telegram.
 
 ПРАВИЛА ОБЩЕНИЯ И СТИЛЯ:
@@ -55,6 +55,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+
+def _safe_reply(message, text: str) -> None:
+    """Reply safely even if Telegram temporarily rejects the request."""
+    try:
+        if hasattr(message, "reply_text"):
+            message.reply_text(text)
+    except Exception:
+        logger.exception("Failed to send Telegram reply")
 
 
 def split_message(text: str) -> Iterable[str]:
@@ -472,7 +481,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             message = "Gemini временно недоступен. Пожалуйста, попробуйте ещё раз чуть позже."
         await update.effective_message.reply_text(message)
         return
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         logger.exception("Gemini request failed")
         await update.effective_message.reply_text(
             "Не удалось получить ответ от Gemini. Проверьте интернет и попробуйте ещё раз."
@@ -490,7 +499,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["history"] = updated_history[-MAX_HISTORY_MESSAGES:]
 
     for part in split_message(reply):
-        await update.effective_message.reply_text(part)
+        try:
+            await update.effective_message.reply_text(part)
+        except Exception:
+            logger.exception("Failed to send message chunk to Telegram")
+            break
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
