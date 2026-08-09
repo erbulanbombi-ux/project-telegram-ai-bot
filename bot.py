@@ -1,56 +1,16 @@
 """Telegram-бот с контекстным AI-ассистентом на Gemini API."""
-import threading
-import time
-from flask import Flask
-
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "Bot is running!", 200
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-threading.Thread(target=run_web, daemon=True).start()
 import json
 import logging
 import os
+import threading
+import time
 from collections.abc import Iterable
 from datetime import timedelta
 from io import BytesIO
 
 from dotenv import load_dotenv
+from flask import Flask
 from google import genai
-
-API_KEYS = [
-    os.environ.get("GEMINI_API_KEY"),
-    os.environ.get("GEMINI_API_KEY_2")
-]
-API_KEYS = [k for k in API_KEYS if k]
-
-def ask_gemini_with_fallback(contents, system_instruction=None):
-    for key in API_KEYS:
-        try:
-            client = genai.Client(api_key=key)
-            config = types.GenerateContentConfig(system_instruction=system_instruction) if system_instruction else None
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=contents,
-                config=config
-            )
-            return response
-        except errors.APIError as e:
-            if "429" in str(e):
-                continue
-            raise e
-    
-    time.sleep(4)
-    client = genai.Client(api_key=API_KEYS[0])
-    config = types.GenerateContentConfig(system_instruction=system_instruction) if system_instruction else None
-    response = ask_gemini_with_fallback(contents=prompt, system_instruction=system_instruction)
-    return response.text
 from google.genai import errors, types
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -70,12 +30,64 @@ from telegram.ext import (
 
 load_dotenv()
 
+# Веб-сервер Flask для Render
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Bot is running!", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+threading.Thread(target=run_web, daemon=True).start()
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
-IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image").strip()
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash").strip()
 MAX_HISTORY_MESSAGES = 12
 TELEGRAM_MESSAGE_LIMIT = 4096
+
+API_KEYS = [
+    os.environ.get("GEMINI_API_KEY"),
+    os.environ.get("GEMINI_API_KEY_2")
+]
+API_KEYS = [k for k in API_KEYS if k]
+
+async def ask_gemini_with_fallback(contents, system_instruction=None, model=None, response_mime_type=None):
+    """Функция ротации ключей для асинхронных запросов."""
+    target_model = model or MODEL
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=0.7,
+        max_output_tokens=2048,
+        response_mime_type=response_mime_type
+    )
+
+    for key in API_KEYS:
+        try:
+            client = genai.Client(api_key=key)
+            response = await client.aio.models.generate_content(
+                model=target_model,
+                contents=contents,
+                config=config
+            )
+            return response
+        except errors.APIError as e:
+            if "429" in str(e):
+                logger.warning(f"Ключ исчерпал лимит, переключаемся на следующий...")
+                continue
+            raise e
+
+    # Если все ключи превысили лимит — делаем паузу 4 секунды и пробуем первый
+    time.sleep(4)
+    client = genai.Client(api_key=API_KEYS[0])
+    return await client.aio.models.generate_content(
+        model=target_model,
+        contents=contents,
+        config=config
+    )
 
 SYSTEM_PROMPT = """
 Ты — сильный, опытный AI-разработчик и понятный ментор по программированию для новичков.
@@ -89,19 +101,14 @@ SYSTEM_PROMPT = """
 6. НЕ используй LaTeX и знаки доллара ($ или $$). Для математических формул используй обычные символы Unicode (x², x₁, √D).
 """
 
-
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
 
 def _safe_reply(message, text: str) -> None:
-    """Reply safely even if Telegram temporarily rejects the request."""
     try:
         if hasattr(message, "reply_text"):
             message.reply_text(text)
@@ -110,7 +117,6 @@ def _safe_reply(message, text: str) -> None:
 
 
 def split_message(text: str) -> Iterable[str]:
-    """Split a long response into Telegram-safe pieces."""
     while text:
         if len(text) <= TELEGRAM_MESSAGE_LIMIT:
             yield text
@@ -138,7 +144,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/remind <min> <text> — Set reminder / Напоминание\n"
         "/help — Full instructions / Помощь"
     )
-    
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -160,7 +165,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a scheduled reminder to the chat that created it."""
     job = context.job
     await context.bot.send_message(
         chat_id=job.chat_id,
@@ -169,7 +173,6 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Schedule a one-time reminder in minutes."""
     if not context.args or len(context.args) < 2:
         await update.effective_message.reply_text(
             "Формат: /remind <минуты> <текст>\n"
@@ -189,8 +192,7 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if context.job_queue is None:
         await update.effective_message.reply_text(
-            "Напоминания не настроены. Установите зависимости из requirements.txt "
-            "и перезапустите бота."
+            "Напоминания не настроены."
         )
         return
 
@@ -208,7 +210,6 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def image_from_response(response: object) -> bytes | None:
-    """Extract the first generated image from a Gemini response."""
     for part in getattr(response, "parts", None) or []:
         inline_data = getattr(part, "inline_data", None)
         if inline_data and getattr(inline_data, "data", None):
@@ -217,10 +218,6 @@ def image_from_response(response: object) -> bytes | None:
 
 
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Create an image from a text prompt and send it back to Telegram."""
-    if client is None:
-        await update.effective_message.reply_text("Gemini ещё не настроен.")
-        return
     if not context.args:
         await update.effective_message.reply_text(
             "Напишите, что создать. Например: /image уютный домик в горах зимой"
@@ -231,11 +228,7 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         await update.effective_message.reply_text("🎨 Создаю изображение, это может занять до минуты…")
         await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
-        response = await client.aio.models.generate_content(
-            model=IMAGE_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
-        )
+        response = await ask_gemini_with_fallback(contents=prompt, model=IMAGE_MODEL)
         image_bytes = image_from_response(response)
         if image_bytes is None:
             await update.effective_message.reply_text(
@@ -246,17 +239,10 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             photo=image_bytes,
             caption=f"AI-изображение: {prompt[:900]}",
         )
-    except errors.APIError as error:
-        logger.exception("Gemini image generation failed: %s", error.code)
-        if str(error.code) == "429":
-            await update.effective_message.reply_text(
-                "🎨 Gemini отклонил запрос: для генерации изображений у этого ключа "
-                "исчерпана или не выдана квота (ошибка 429). Включите биллинг либо "
-                "квоту для gemini-3.1-flash-image и повторите запрос."
-            )
-            return
+    except Exception as error:
+        logger.exception("Gemini image generation failed: %s", error)
         await update.effective_message.reply_text(
-            "Не удалось создать изображение. Проверьте доступ Gemini API и попробуйте ещё раз."
+            "Не удалось создать изображение. Попробуйте ещё раз."
         )
 
 
@@ -270,7 +256,6 @@ def add_textbox(slide, text: str, left, top, width, height, size: int, color) ->
 
 
 def create_presentation(slides: list[dict[str, object]], cover_image: bytes | None) -> BytesIO:
-    """Build a visual, card-based PowerPoint file from the AI slide outline."""
     presentation = Presentation()
     presentation.slide_width = Inches(13.333)
     presentation.slide_height = Inches(7.5)
@@ -367,10 +352,6 @@ def create_presentation(slides: list[dict[str, object]], cover_image: bytes | No
 
 
 async def slides_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate a PowerPoint presentation, optionally based on a submitted image."""
-    if client is None:
-        await update.effective_message.reply_text("Gemini ещё не настроен.")
-        return
     command_args = context.args
     caption = update.effective_message.caption or ""
     if not command_args and caption.startswith("/slides"):
@@ -416,21 +397,16 @@ async def slides_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         await update.effective_chat.send_action(ChatAction.TYPING)
-        response = await client.aio.models.generate_content(
-            model=MODEL,
+        response = await ask_gemini_with_fallback(
             contents=types.Content(role="user", parts=contents),
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.4,
-                max_output_tokens=2048,
-            ),
+            response_mime_type="application/json"
         )
         outline = json.loads((response.text or "").strip())
         slides = outline.get("slides", [])
         if not isinstance(slides, list) or not 2 <= len(slides) <= 10:
             raise ValueError("invalid slide outline")
         document = create_presentation(slides, image_bytes)
-    except (errors.APIError, OSError, ValueError, json.JSONDecodeError):
+    except Exception:
         logger.exception("Presentation generation failed")
         await message.reply_text(
             "Не удалось создать презентацию. Попробуйте сделать тему короче и отправить ещё раз."
@@ -446,12 +422,6 @@ async def slides_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if client is None:
-        await update.effective_message.reply_text(
-            "Бот ещё не настроен: добавьте GEMINI_API_KEY в файл .env и перезапустите его."
-        )
-        return
-
     message = update.effective_message
     user_text = (message.text or message.caption or "").strip()
     if message.caption and message.caption.startswith("/slides"):
@@ -502,32 +472,20 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_chat.send_action(
             ChatAction.UPLOAD_PHOTO if image else ChatAction.TYPING
         )
-        response = await client.aio.models.generate_content(
-            model=MODEL,
+        
+        # Передаём запрос в функцию с ротацией ключей
+        response = await ask_gemini_with_fallback(
             contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.7,
-                max_output_tokens=2048,
-            ),
+            system_instruction=SYSTEM_PROMPT
         )
+        
         reply = (response.text or "").strip() or (
             "Не удалось сформировать ответ. Попробуйте переформулировать вопрос."
         )
-    except errors.APIError as error:
-        logger.exception("Gemini API request failed: %s", error.code)
-        if error.code == 429:
-            message = "Слишком много запросов к Gemini. Подождите немного и попробуйте ещё раз."
-        elif error.code in {401, 403}:
-            message = "Не удалось авторизоваться в Gemini. Проверьте GEMINI_API_KEY в файле .env."
-        else:
-            message = "Gemini временно недоступен. Пожалуйста, попробуйте ещё раз чуть позже."
-        await update.effective_message.reply_text(message)
-        return
-    except (OSError, ValueError, TypeError):
-        logger.exception("Gemini request failed")
+    except Exception as error:
+        logger.exception("Gemini API request failed: %s", error)
         await update.effective_message.reply_text(
-            "Не удалось получить ответ от Gemini. Проверьте интернет и попробуйте ещё раз."
+            "Произошла ошибка при обращении к Gemini. Попробуйте ещё раз."
         )
         return
 
@@ -548,19 +506,18 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="Markdown"
             )
         except Exception:
-            # Запасной вариант: если в Markdown ошибка, отправляем обычным текстом
             await update.effective_message.reply_text(part)
-            
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception while processing an update", exc_info=context.error)
 
 
 def main() -> None:
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "your_telegram_bot_token":
+    if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from .env")
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key":
-        raise RuntimeError("GEMINI_API_KEY is missing from .env")
+    if not API_KEYS:
+        raise RuntimeError("No GEMINI_API_KEY provided")
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
