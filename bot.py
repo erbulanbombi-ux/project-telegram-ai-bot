@@ -30,19 +30,21 @@ from telegram.ext import (
 
 load_dotenv()
 
-# Веб-сервер Flask для Render
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Bot is running!", 200
+    return "Bot is active and running!", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
+# Запускаем Flask в отдельном демоническом потоке
 threading.Thread(target=run_web, daemon=True).start()
 
+# --- КОНФИГУРАЦИЯ И КЛЮЧИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash").strip()
@@ -61,9 +63,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+SYSTEM_PROMPT = """
+Ты — сильный, опытный AI-разработчик и понятный ментор по программированию для новичков.
 
+ТВОЙ СТИЛЬ И ПРАВИЛА ОТВЕТА:
+1. При написании любой программы или исправлении ошибок СТРОГО оборачивай код в блоки Markdown с указанием языка (например, ```python ... ```).
+2. Объясняй ошибки простым и доступным языком. Избегай сухих академических терминов.
+3. Пиши чистый, рабочий и понятный код.
+4. Сначала давай полностью исправленный код в блоке, а затем простым языком поясняй, в чём были ошибки и как они исправлены.
+5. Общайся естественно, легко и поддерживающе.
+6. НЕ используй LaTeX и знаки доллара ($ или $$). Для математических формул используй обычные символы Unicode (x², x₁, √D).
+"""
+
+# --- ФУНКЦИЯ РОТАЦИИ КЛЮЧЕЙ (БЕЗ БЛОКИРОВКИ EVENT LOOP) ---
 async def ask_gemini_with_fallback(contents, system_instruction=None, model=None, response_mime_type=None):
-    """Функция ротации ключей для асинхронных запросов."""
     target_model = model or MODEL
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
@@ -72,7 +85,7 @@ async def ask_gemini_with_fallback(contents, system_instruction=None, model=None
         response_mime_type=response_mime_type
     )
 
-    for key in API_KEYS:
+    for i, key in enumerate(API_KEYS):
         try:
             client = genai.Client(api_key=key)
             response = await client.aio.models.generate_content(
@@ -81,17 +94,11 @@ async def ask_gemini_with_fallback(contents, system_instruction=None, model=None
                 config=config
             )
             return response
-        except errors.APIError as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                logger.warning(f"Ключ {key[:8]}... исчерпал лимит, переключаемся на следующий...")
-                continue
-            logger.error(f"Ошибка Gemini API: {e}")
-            raise e
         except Exception as e:
-            logger.error(f"Неизвестная ошибка при запросе к Gemini: {e}")
-            raise e
+            logger.warning(f"Ключ #{i+1} ({key[:8]}...) выдал ошибку: {e}")
+            continue
 
-    # Неблокирующая пауза, если все ключи превысили лимит
+    # Если все ключи временно заблокированы — делаем паузу 4 секунды
     logger.warning("Все API ключи исчерпали лимит. Ждем 4 секунды...")
     await asyncio.sleep(4)
     client = genai.Client(api_key=API_KEYS[0])
@@ -101,19 +108,7 @@ async def ask_gemini_with_fallback(contents, system_instruction=None, model=None
         config=config
     )
 
-SYSTEM_PROMPT = """
-Ты — сильный, опытный AI-разработчик и понятный ментор по программированию для новичков.
-
-ТВОЙ СТИЛЬ И ПРАВИЛА ОТВЕТА:
-1. При написании любой программы или исправлении ошибок СТРОГО оборачивай код в блоки Markdown с указанием языка (например, ```python ... ```). Это критически важно, чтобы пользователю было удобно копировать код!
-2. Объясняй ошибки простым и доступным языком. Избегай сухих академических терминов (вместо "конкатенация" пиши "склеивание текста", вместо "итерирование" — "перебор элементов"). Объясняй так, будто учишь школьника или начинающего: с простыми примерами и жизненными аналогиями.
-3. Пиши чистый, рабочий и понятный код.
-4. Сначала давай полностью исправленный и рабочий код в блоке, а затем простым языком поясняй, в чём были ошибки и как они исправлены.
-5. Общайся естественно, легко и поддерживающе, как дружелюбный старший товарищ.
-6. НЕ используй LaTeX и знаки доллара ($ или $$). Для математических формул используй обычные символы Unicode (x², x₁, √D).
-"""
-
-
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def split_message(text: str) -> Iterable[str]:
     while text:
         if len(text) <= TELEGRAM_MESSAGE_LIMIT:
@@ -129,25 +124,22 @@ def split_message(text: str) -> Iterable[str]:
         yield text[:split_at]
         text = text[split_at:].lstrip()
 
-
+# --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "👋 **Welcome / Привет!**\n\n"
-        "🇬🇧 I am an AI coding mentor and study assistant. Send me a message, a snippet of code, or a photo to get started!\n\n"
-        "🇷🇺 Я AI-ментор и помощник в учебе. Напиши мне вопрос, отправь код или фото задачи!\n\n"
-        "📌 **Commands / Команды:**\n"
-        "/reset — Clear context / Очистить историю\n"
-        "/slides <topic> — Create PPTX / Создать презентацию\n"
-        "/image <prompt> — Generate image / AI-картинка\n"
-        "/remind <min> <text> — Set reminder / Напоминание\n"
-        "/help — Full instructions / Помощь"
+        "👋 **Привет! / Welcome!**\n\n"
+        "Я AI-ментор по программированию и помощник в учебе. Задай вопрос, отправь код или фото задачи!\n\n"
+        "📌 **Команды:**\n"
+        "/reset — Очистить историю диалога\n"
+        "/slides <тема> — Создать презентацию PPTX\n"
+        "/image <описание> — Сгенерировать картинку\n"
+        "/remind <минуты> <текст> — Поставить напоминание\n"
+        "/help — Помощь и подробности"
     )
-
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("history", None)
     await update.effective_message.reply_text("История диалога очищена. Начнём заново!")
-
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
@@ -156,11 +148,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Напоминание: /remind <минуты> <текст>\n"
         "Пример: /remind 30 Выпить воды\n\n"
         "AI-изображение: /image <описание>\n"
-        "Презентация: /slides <тема>. Можно отправить фото с подписью «/slides» "
-        "— оно станет основой презентации и попадёт на титульный слайд.\n\n"
-        "Используйте /reset, если хотите начать новую тему."
+        "Презентация: /slides <тема>.\n\n"
+        "Используйте /reset, чтобы очистить контекст."
     )
-
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
@@ -169,12 +159,10 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         text=f"⏰ Напоминание: {job.data['text']}",
     )
 
-
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or len(context.args) < 2:
         await update.effective_message.reply_text(
-            "Формат: /remind <минуты> <текст>\n"
-            "Например: /remind 30 Выпить воды"
+            "Формат: /remind <минуты> <текст>\nНапример: /remind 30 Выпить воды"
         )
         return
 
@@ -183,9 +171,7 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if minutes < 1 or minutes > 43_200:
             raise ValueError
     except ValueError:
-        await update.effective_message.reply_text(
-            "Укажите целое число минут от 1 до 43200 (30 дней)."
-        )
+        await update.effective_message.reply_text("Укажите число минут от 1 до 43200.")
         return
 
     if context.job_queue is None:
@@ -204,7 +190,6 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Хорошо, напомню через {minutes} мин.: {reminder_text}"
     )
 
-
 def image_from_response(response: object) -> bytes | None:
     for part in getattr(response, "parts", None) or []:
         inline_data = getattr(part, "inline_data", None)
@@ -212,36 +197,29 @@ def image_from_response(response: object) -> bytes | None:
             return bytes(inline_data.data)
     return None
 
-
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.effective_message.reply_text(
-            "Напишите, что создать. Например: /image уютный домик в горах зимой"
-        )
+        await update.effective_message.reply_text("Напишите, что создать. Например: /image уютный домик в горах")
         return
 
     prompt = " ".join(context.args)
     try:
-        await update.effective_message.reply_text("🎨 Создаю изображение, это может занять до минуты…")
+        await update.effective_message.reply_text("🎨 Создаю изображение...")
         await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
         response = await ask_gemini_with_fallback(contents=prompt, model=IMAGE_MODEL)
         image_bytes = image_from_response(response)
         if image_bytes is None:
-            await update.effective_message.reply_text(
-                "Не удалось получить изображение. Попробуйте изменить описание."
-            )
+            await update.effective_message.reply_text("Не удалось сгенерировать изображение.")
             return
         await update.effective_message.reply_photo(
             photo=image_bytes,
             caption=f"AI-изображение: {prompt[:900]}",
         )
     except Exception as error:
-        logger.exception("Gemini image generation failed: %s", error)
-        await update.effective_message.reply_text(
-            "Не удалось создать изображение. Попробуйте ещё раз."
-        )
+        logger.exception("Image generation failed: %s", error)
+        await update.effective_message.reply_text("Ошибка при создании изображения.")
 
-
+# --- ГЕНЕРАЦИЯ ПРЕЗЕНТАЦИЙ (PPTX) ---
 def add_textbox(slide, text: str, left, top, width, height, size: int, color) -> None:
     box = slide.shapes.add_textbox(left, top, width, height)
     paragraph = box.text_frame.paragraphs[0]
@@ -249,7 +227,6 @@ def add_textbox(slide, text: str, left, top, width, height, size: int, color) ->
     paragraph.font.size = Pt(size)
     paragraph.font.color.rgb = RGBColor(*color)
     return box
-
 
 def create_presentation(slides: list[dict[str, object]], cover_image: bytes | None) -> BytesIO:
     presentation = Presentation()
@@ -276,6 +253,7 @@ def create_presentation(slides: list[dict[str, object]], cover_image: bytes | No
         blob.fill.solid()
         blob.fill.fore_color.rgb = RGBColor(*pale_accent)
         blob.line.fill.background()
+
         accent_bar = slide.shapes.add_shape(
             MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.7), Inches(0.55), Inches(0.78), Inches(0.15)
         )
@@ -300,7 +278,7 @@ def create_presentation(slides: list[dict[str, object]], cover_image: bytes | No
                     BytesIO(cover_image), Inches(8.55), Inches(1.85), width=Inches(3.8)
                 )
             except (OSError, ValueError):
-                logger.warning("Could not insert cover image into presentation")
+                logger.warning("Could not insert cover image")
 
         bullets = slide_data.get("bullets", [])
         if not isinstance(bullets, list):
@@ -309,6 +287,7 @@ def create_presentation(slides: list[dict[str, object]], cover_image: bytes | No
         content_width = Inches(7.1) if index == 0 and cover_image else Inches(11.7)
         columns = 1 if len(visible_bullets) < 3 or (index == 0 and cover_image) else 2
         card_width = (content_width - Inches(0.25 * (columns - 1))) / columns
+
         for bullet_index, bullet in enumerate(visible_bullets):
             column = bullet_index % columns
             row = bullet_index // columns
@@ -346,16 +325,13 @@ def create_presentation(slides: list[dict[str, object]], cover_image: bytes | No
     file.seek(0)
     return file
 
-
 async def slides_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     command_args = context.args
     caption = update.effective_message.caption or ""
     if not command_args and caption.startswith("/slides"):
         command_args = caption.split()[1:]
     if not command_args:
-        await update.effective_message.reply_text(
-            "Укажите тему: /slides Экология. Можно отправить фото с этой подписью."
-        )
+        await update.effective_message.reply_text("Укажите тему: /slides Искусственный интеллект")
         return
 
     message = update.effective_message
@@ -371,25 +347,19 @@ async def slides_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 mime_type=getattr(image, "mime_type", None) or "image/jpeg",
             )
         except (OSError, ValueError, TelegramError):
-            await message.reply_text("Не удалось скачать изображение для презентации.")
+            await message.reply_text("Не удалось скачать картинку для презентации.")
             return
 
     topic = " ".join(command_args)
     prompt = (
-        "Составь план презентации на русском языке по теме: " + topic + ". "
+        f"Составь план презентации на русском языке по теме: {topic}. "
         "Верни только корректный JSON без Markdown: объект с ключом slides. "
         "slides — массив из 5–7 объектов; у каждого title (короткий заголовок) "
-        "и bullets (массив из 3–5 коротких тезисов). "
-        "Первый слайд — титульный, последний — выводы."
+        "и bullets (массив из 3–5 коротких тезисов)."
     )
     contents = [types.Part.from_text(text=prompt)]
     if image_part:
         contents.append(image_part)
-        contents.append(
-            types.Part.from_text(
-                text="Проанализируй приложенное изображение и используй его как контекст презентации."
-            )
-        )
 
     try:
         await update.effective_chat.send_action(ChatAction.TYPING)
@@ -404,19 +374,17 @@ async def slides_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         document = create_presentation(slides, image_bytes)
     except Exception:
         logger.exception("Presentation generation failed")
-        await message.reply_text(
-            "Не удалось создать презентацию. Попробуйте сделать тему короче и отправить ещё раз."
-        )
+        await message.reply_text("Не удалось создать презентацию. Попробуйте еще раз.")
         return
 
     await update.effective_chat.send_action(ChatAction.UPLOAD_DOCUMENT)
     await message.reply_document(
         document=document,
-        filename="ai_presentation.pptx",
-        caption=f"Готово: презентация по теме «{topic[:120]}»."
+        filename="presentation.pptx",
+        caption=f"Презентация по теме «{topic[:120]}» готова!"
     )
 
-
+# --- ОСНОВНОЙ ЧАТ С ИСТОРИЕЙ ---
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user_text = (message.text or message.caption or "").strip()
@@ -429,85 +397,79 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     history: list[dict[str, str]] = context.user_data.get("history", [])
-    contents = [
-        types.Content(
-            role=item["role"],
-            parts=[types.Part.from_text(text=item["content"])],
-        )
-        for item in history
-    ]
+    contents = []
+
+    # Добавляем историю сообщений
+    for item in history:
+        contents.append({
+            "role": item["role"],
+            "parts": [{"text": item["content"]}]
+        })
+
+    # Добавляем текущий запрос
     user_parts = []
     if image:
         try:
             file = await image.get_file()
             image_bytes = await file.download_as_bytearray()
-        except (OSError, ValueError, TelegramError):
-            logger.exception("Telegram photo download failed")
-            await message.reply_text(
-                "Не удалось скачать фотографию. Пожалуйста, отправьте её ещё раз."
+            user_parts.append(
+                types.Part.from_bytes(
+                    data=bytes(image_bytes),
+                    mime_type=getattr(image, "mime_type", None) or "image/jpeg",
+                )
             )
+        except (OSError, ValueError, TelegramError) as e:
+            logger.exception("Telegram photo download failed: %s", e)
+            await message.reply_text("Не удалось скачать изображение.")
             return
 
-        user_parts.append(
-            types.Part.from_bytes(
-                data=bytes(image_bytes),
-                mime_type=getattr(image, "mime_type", None) or "image/jpeg",
-            )
-        )
-        user_parts.append(
-            types.Part.from_text(
-                text=user_text or "Опиши и проанализируй это изображение."
-            )
-        )
-    else:
-        user_parts.append(types.Part.from_text(text=user_text))
+    if user_text or not image:
+        user_parts.append(types.Part.from_text(text=user_text or "Опиши и проанализируй это изображение."))
 
-    contents.append(types.Content(role="user", parts=user_parts))
+    contents.append({
+        "role": "user",
+        "parts": user_parts
+    })
 
     try:
         await update.effective_chat.send_action(
             ChatAction.UPLOAD_PHOTO if image else ChatAction.TYPING
         )
-        
+
         response = await ask_gemini_with_fallback(
             contents=contents,
             system_instruction=SYSTEM_PROMPT
         )
-        
-        reply = (response.text or "").strip() or (
-            "Не удалось сформировать ответ. Попробуйте переформулировать вопрос."
-        )
+
+        reply = (response.text or "").strip() or "Не удалось сформировать ответ. Попробуйте переформулировать."
+
     except Exception as error:
-        logger.exception("Gemini API request failed: %s", error)
-        await update.effective_message.reply_text(
-            "Произошла ошибка при обращении к Gemini. Попробуйте ещё раз."
-        )
+        logger.error("Ошибка в функции chat: %s", error, exc_info=True)
+        await update.effective_message.reply_text("Произошла ошибка при обращении к Gemini. Попробуйте еще раз.")
         return
 
+    # Сохраняем успешный ответ в историю
     updated_history = [
         *history,
         {
             "role": "user",
-            "content": user_text or "[Пользователь отправил фотографию для анализа]",
+            "content": user_text or "[Отправлено изображение]",
         },
         {"role": "model", "content": reply},
     ]
     context.user_data["history"] = updated_history[-MAX_HISTORY_MESSAGES:]
 
+    # Отправляем ответ частями
     for part in split_message(reply):
         try:
-            await update.effective_message.reply_text(
-                part, 
-                parse_mode="Markdown"
-            )
+            await update.effective_message.reply_text(part, parse_mode="Markdown")
         except Exception:
             await update.effective_message.reply_text(part)
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception while processing an update", exc_info=context.error)
+    logger.exception("Unhandled exception while processing update", exc_info=context.error)
 
-
+# --- ТОЧКА ВХОДА ---
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from .env")
@@ -529,9 +491,8 @@ def main() -> None:
     )
     application.add_error_handler(error_handler)
 
-    logger.info("Bot is starting")
+    logger.info("Bot starting...")
     application.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
