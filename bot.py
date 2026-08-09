@@ -1,5 +1,6 @@
 """Telegram-бот с контекстным AI-ассистентом на Gemini API."""
 import threading
+import time
 from flask import Flask
 
 app = Flask(__name__)
@@ -22,6 +23,34 @@ from io import BytesIO
 
 from dotenv import load_dotenv
 from google import genai
+
+API_KEYS = [
+    os.environ.get("GEMINI_API_KEY"),
+    os.environ.get("GEMINI_API_KEY_2")
+]
+API_KEYS = [k for k in API_KEYS if k]
+
+def ask_gemini_with_fallback(contents, system_instruction=None):
+    for key in API_KEYS:
+        try:
+            client = genai.Client(api_key=key)
+            config = types.GenerateContentConfig(system_instruction=system_instruction) if system_instruction else None
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=config
+            )
+            return response
+        except errors.APIError as e:
+            if "429" in str(e):
+                continue
+            raise e
+    
+    time.sleep(4)
+    client = genai.Client(api_key=API_KEYS[0])
+    config = types.GenerateContentConfig(system_instruction=system_instruction) if system_instruction else None
+    response = ask_gemini_with_fallback(contents=prompt, system_instruction=system_instruction)
+    return response.text
 from google.genai import errors, types
 from pptx import Presentation
 from pptx.dml.color import RGBColor
