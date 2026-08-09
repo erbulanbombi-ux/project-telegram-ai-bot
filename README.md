@@ -33,8 +33,5 @@ An intelligent, multimodal Telegram bot powered by the **Google Gemini API**. Bu
 
 ### 1. Clone the repository
 ```bash
-### 1. Clone the repository
-```bash
-git clone https://github.com/erbulanbombi-ux/project-telegram-ai-bot.git
-cd project-telegram-ai-bot
+git clone [https://github.com/erbulanbombi-ux/project-telegram-ai-bot.git](https://github.com/erbulanbombi-ux/project-telegram-ai-bot.git)
 cd project-telegram-ai-bot
