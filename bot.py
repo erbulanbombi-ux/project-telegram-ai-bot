@@ -45,12 +45,12 @@ def run_web():
 threading.Thread(target=run_web, daemon=True).start()
 
 # --- КОНФИГУРАЦИЯ И КЛЮЧИ ---
+# --- КОНФИГУРАЦИЯ И КЛЮЧИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash").strip()
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-3.0-generate-002").strip()
 MAX_HISTORY_MESSAGES = 12
 TELEGRAM_MESSAGE_LIMIT = 4096
-
 API_KEYS = [
     os.environ.get("GEMINI_API_KEY"),
     os.environ.get("GEMINI_API_KEY_2")
