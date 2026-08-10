@@ -7,12 +7,14 @@ import threading
 from collections.abc import Iterable
 from datetime import timedelta
 from io import BytesIO
+import time
 
 from dotenv import load_dotenv
 from flask import Flask
 from google import genai
 from google.genai import errors, types
 from pptx import Presentation
+from wsgiref.simple_server import make_server
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import PP_ALIGN
@@ -39,7 +41,9 @@ def health_check():
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    with make_server('0.0.0.0', port, app) as httpd:
+        logger.info(f"WSGI server running on port {port}")
+        httpd.serve_forever()
 
 # Запускаем Flask в отдельном демоническом потоке
 threading.Thread(target=run_web, daemon=True).start()
@@ -51,11 +55,20 @@ MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-3.0-generate-002").strip()
 MAX_HISTORY_MESSAGES = 12
 TELEGRAM_MESSAGE_LIMIT = 4096
-API_KEYS = [
-    os.environ.get("GEMINI_API_KEY"),
-    os.environ.get("GEMINI_API_KEY_2")
-]
-API_KEYS = [k for k in API_KEYS if k]
+def get_api_keys() -> list[str]:
+    load_dotenv(override=True)
+    keys = [
+        os.environ.get("GEMINI_API_KEY"),
+        os.environ.get("GEMINI_API_KEY_2"),
+        os.environ.get("GEMINI_API_KEY_3"),
+    ]
+    return [k for k in keys if k]
+
+API_KEYS = get_api_keys()
+
+IMAGE_COOLDOWN_SECONDS = int(os.environ.get("IMAGE_COOLDOWN_SECONDS", "300"))
+# timestamp until which image generation is disabled (epoch seconds)
+image_disabled_until = 0.0
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -63,8 +76,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+FALLBACK_TEXT_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+]
+FALLBACK_IMAGE_MODELS = [
+    "imagen-3.0-generate-002",
+    "imagen-2.0-preview",
+]
+
 
 def is_gemini_unavailable_error(error: Exception) -> bool:
+    # Prefer structured ClientError checks when available
+    try:
+        if isinstance(error, errors.ClientError):
+            msg = str(error).lower()
+            if "429" in msg or "resource_exhausted" in msg or "quota" in msg or "rate limit" in msg:
+                return True
+            # some ClientError objects may expose a code/status attribute
+            code = getattr(error, "code", None) or getattr(error, "status", None) or getattr(error, "status_code", None)
+            try:
+                if int(code) == 429:
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     message = str(error).lower()
     return any(token in message for token in (
         "429",
@@ -83,7 +121,7 @@ def format_gemini_error_message(error: Exception) -> str:
     if is_gemini_unavailable_error(error):
         return (
             "Сейчас Gemini временно недоступен или достигнут лимит запросов. "
-            "Подождите немного и попробуйте ещё раз."
+            "Подождите немного и попробуйте ещё раз. Если проблема повторяется, отправьте /status для диагностики."
         )
 
     message = str(error).lower()
@@ -94,69 +132,77 @@ def format_gemini_error_message(error: Exception) -> str:
 
 
 SYSTEM_PROMPT = """
-Ты — сильный, опытный AI-разработчик и понятный ментор по программированию для новичков.
+Ты — профессиональный разработчик с многолетним опытом. Объясняешь хорошо и понятно.
 
-ТВОЙ СТИЛЬ И ПРАВИЛА ОТВЕТА:
-1. ВСЕГДА оборачивай ВСЕ коды в блоки Markdown с указанием языка. НИКОГДА не пиши код без блока.
-   ✓ Правильно:
-   ```python
-   def hello():
-       print("Hello")
-   ```
-   ✓ Правильно для Bash/Shell:
-   ```bash
-   git add bot.py
-   git commit -m "fix"
-   git push
-   ```
-   ✗ Неправильно:
-   def hello():
-       print("Hello")
-
-2. Указывай язык программирования ВСЕГДА: python, javascript, bash, sql, html, css, java, cpp, go, rust, kotlin, swift и т.д.
-3. Объясняй ошибки простым и доступным языком. Избегай сухих академических терминов.
-4. Пиши чистый, рабочий и понятный код.
-5. Сначала давай полностью исправленный код в блоке, а затем простым языком поясняй, в чём были ошибки и как они исправлены.
-6. Общайся естественно, легко и поддерживающе.
-7. НЕ используй LaTeX и знаки доллара ($ или $$). Для математических формул используй обычные символы Unicode (x², x₁, √D).
+ТВОЙ СТИЛЬ:
+1. Говоришь профессионально, но доступно — как опытный коллега новичку
+2. ВСЕ коды в блоках Markdown с языком: ```python, ```bash, ```javascript и т.д.
+3. Структура ответа:
+   • Сначала решение (код)
+   • Потом объяснение: почему это так, как это работает
+   • Если нужно — альтернативы и лучшие практики
+4. Объясняй суть, а не только синтаксис. Помогай понять, ЧТО делается и ПОЧЕМУ
+5. Примеры из реальной жизни, если помогут пониманию
+6. Не используй LaTeX ($ $$) — формулы через Unicode: x², √D, ∑, ≠
 """
 
 # --- ФУНКЦИЯ РОТАЦИИ КЛЮЧЕЙ (БЕЗ БЛОКИРОВКИ EVENT LOOP) ---
+def get_models_to_try(model: str, is_image: bool = False) -> list[str]:
+    models = [model]
+    fallbacks = FALLBACK_IMAGE_MODELS if is_image else FALLBACK_TEXT_MODELS
+    for fallback in fallbacks:
+        if fallback != model:
+            models.append(fallback)
+    return models
+
+
 async def ask_gemini_with_fallback(contents, system_instruction=None, model=None, response_mime_type=None):
-    if not API_KEYS:
+    keys = get_api_keys()
+    if not keys:
         raise RuntimeError("No GEMINI_API_KEY provided")
 
     target_model = model or MODEL
+    is_image = (
+        target_model.startswith("imagen")
+        or (target_model.startswith("gemini-3") and "image" in target_model.lower())
+    )
+    model_candidates = get_models_to_try(target_model, is_image=is_image)
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=0.7,
-        max_output_tokens=2048,
+        max_output_tokens=8192,
         response_mime_type=response_mime_type
     )
 
     last_error = None
-    for attempt in range(2):
-        for i, key in enumerate(API_KEYS):
-            try:
-                client = genai.Client(api_key=key)
-                response = await client.aio.models.generate_content(
-                    model=target_model,
-                    contents=contents,
-                    config=config
-                )
-                return response
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Ключ #{i+1} ({key[:8]}...) выдал ошибку на попытке {attempt + 1}: {e}")
-                if not is_gemini_unavailable_error(e):
-                    break
+    for model_name in model_candidates:
+        for attempt in range(2):
+            for i, key in enumerate(keys):
+                try:
+                    client = genai.Client(api_key=key)
+                    response = await client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config
+                    )
+                    if model_name != target_model:
+                        logger.info(f"Успешно отвечено на модели {model_name} после сбоя {target_model}")
+                    return response
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Ключ #{i+1} ({key[:8]}...) модель {model_name} ошибка на попытке {attempt + 1}: {e}")
+                    if not is_gemini_unavailable_error(e):
+                        break
 
-        if attempt == 0 and is_gemini_unavailable_error(last_error):
-            logger.warning("Временная ошибка Gemini. Повторяем запрос через 2 секунды...")
-            await asyncio.sleep(2)
-            continue
+            if attempt == 0 and is_gemini_unavailable_error(last_error):
+                logger.warning("Временная ошибка Gemini. Повторяем запрос через 2 секунды...")
+                await asyncio.sleep(2)
+                continue
 
-        break
+            break
+
+        if last_error is None or not is_gemini_unavailable_error(last_error):
+            break
 
     if last_error is not None:
         raise last_error
@@ -207,6 +253,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Используйте /reset, чтобы очистить контекст."
     )
 
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current API key count, active models and image-generation status."""
+    keys = get_api_keys()
+    remaining = 0
+    if image_disabled_until and image_disabled_until > time.time():
+        remaining = int(image_disabled_until - time.time())
+
+    text = (
+        f"API keys loaded: {len(keys)}\n"
+        f"Text model: {MODEL}\n"
+        f"Image model: {IMAGE_MODEL}\n"
+    )
+    if remaining > 0:
+        text += f"Image generation: temporarily disabled (cooldown {remaining}s)"
+    else:
+        text += "Image generation: enabled"
+
+    await update.effective_message.reply_text(text)
+
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
     await context.bot.send_message(
@@ -256,8 +322,16 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not context.args:
         await update.effective_message.reply_text("Напишите, что создать. Например: /image уютный домик в горах")
         return
-
     prompt = " ".join(context.args)
+
+    global image_disabled_until
+    if image_disabled_until and image_disabled_until > time.time():
+        remaining = int(image_disabled_until - time.time())
+        await update.effective_message.reply_text(
+            f"Генерация изображений временно отключена ({remaining}s). Попробуйте позже или используйте текстовый чат."
+        )
+        return
+
     try:
         await update.effective_message.reply_text("🎨 Создаю изображение...")
         await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
@@ -272,6 +346,14 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     except Exception as error:
         logger.exception("Image generation failed: %s", error)
+        # If quota/429, disable image generation for a short cooldown to avoid repeated failures
+        if is_gemini_unavailable_error(error):
+            image_disabled_until = time.time() + IMAGE_COOLDOWN_SECONDS
+            await update.effective_message.reply_text(
+                f"Генерация изображений временно недоступна из-за лимитов Gemini. Отключено на {IMAGE_COOLDOWN_SECONDS} секунд."
+            )
+            return
+
         await update.effective_message.reply_text(format_gemini_error_message(error))
 
 # --- ГЕНЕРАЦИЯ ПРЕЗЕНТАЦИЙ (PPTX) ---
@@ -537,6 +619,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("remind", remind))
     application.add_handler(CommandHandler("image", image_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("slides", slides_command))
     application.add_handler(
         MessageHandler(

@@ -1,6 +1,6 @@
 import asyncio
-import types as pytypes
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import bot
 
@@ -38,28 +38,44 @@ class FakeContext:
 
 
 class BotChatTests(unittest.TestCase):
-    def test_chat_returns_reply_without_crashing(self):
+    def test_chat_returns_friendly_message_when_gemini_is_unavailable(self):
+        async def run_test():
+            update = FakeUpdate()
+            context = FakeContext()
+
+            with patch(
+                "bot.ask_gemini_with_fallback",
+                new=AsyncMock(side_effect=RuntimeError("429 RESOURCE_EXHAUSTED")),
+            ):
+                await bot.chat(update, context)
+
+            self.assertIn(
+                "Сейчас Gemini временно недоступен",
+                update.effective_message.replies[-1],
+            )
+
+        asyncio.run(run_test())
+
+    def test_retry_logic_treats_quota_error_as_transient(self):
         async def run_test():
             class FakeResponse:
-                text = "Привет! Я на связи."
+                text = "Ответ после повтора"
 
             class FakeModels:
                 async def generate_content(self, **kwargs):
                     return FakeResponse()
 
             class FakeClient:
-                aio = pytypes.SimpleNamespace(models=FakeModels())
+                aio = type("aio", (), {"models": FakeModels()})
 
-            original_client = bot.client
-            bot.client = FakeClient()
+            original_client = bot.genai.Client
+            bot.genai.Client = lambda api_key=None: FakeClient()
             try:
-                update = FakeUpdate()
-                context = FakeContext()
-                await bot.chat(update, context)
+                response = await bot.ask_gemini_with_fallback(contents=["hi"])
             finally:
-                bot.client = original_client
+                bot.genai.Client = original_client
 
-            self.assertTrue(update.effective_message.replies)
+            self.assertEqual(response.text, "Ответ после повтора")
 
         asyncio.run(run_test())
 
